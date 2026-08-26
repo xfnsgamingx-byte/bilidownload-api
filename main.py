@@ -1,9 +1,12 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, HttpUrl
+from pydantic import BaseModel
 import re
 
-app = FastAPI(title="BiliDownload API")
+app = FastAPI(
+    title="BiliDownload API",
+    description="Bilibili link validation API"
+)
 
 app.add_middleware(
     CORSMiddleware,
@@ -12,6 +15,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
 
 class VideoRequest(BaseModel):
     url: str
@@ -27,7 +31,9 @@ def home():
 
 @app.get("/health")
 def health():
-    return {"status": "healthy"}
+    return {
+        "status": "healthy"
+    }
 
 
 @app.post("/api/process")
@@ -38,15 +44,20 @@ def process_video(data: VideoRequest):
     if not url:
         raise HTTPException(
             status_code=400,
-            detail="Please provide a video URL."
+            detail="Please provide a Bilibili video URL."
         )
 
     bilibili_patterns = [
-        r"bilibili\.com",
-        r"b23\.tv"
+        r"(^|//)(www\.)?bilibili\.com/",
+        r"(^|//)b23\.tv/"
     ]
 
-    if not any(re.search(pattern, url, re.IGNORECASE) for pattern in bilibili_patterns):
+    is_valid = any(
+        re.search(pattern, url, re.IGNORECASE)
+        for pattern in bilibili_patterns
+    )
+
+    if not is_valid:
         raise HTTPException(
             status_code=400,
             detail="Please enter a valid Bilibili URL."
@@ -54,7 +65,12 @@ def process_video(data: VideoRequest):
 
     return {
         "success": True,
-        "message": "Valid Bilibili link received.",
+        "message": "Bilibili link received successfully.",
         "source_url": url,
-        "note": "Media processing for publicly accessible, non-DRM content will be added to this endpoint."
+        "downloads": [],
+        "note": (
+            "This API currently validates and receives the link. "
+            "Download options can only be returned when publicly accessible, "
+            "non-DRM media URLs are available to the server."
+        )
     }
