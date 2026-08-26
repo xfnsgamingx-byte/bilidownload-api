@@ -2,10 +2,11 @@ from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import re
+import yt_dlp
 
 app = FastAPI(
     title="BiliDownload API",
-    description="Bilibili link validation API"
+    description="Publicly accessible Bilibili media processor"
 )
 
 app.add_middleware(
@@ -63,14 +64,59 @@ def process_video(data: VideoRequest):
             detail="Please enter a valid Bilibili URL."
         )
 
-    return {
-        "success": True,
-        "message": "Bilibili link received successfully.",
-        "source_url": url,
-        "downloads": [],
-        "note": (
-            "This API currently validates and receives the link. "
-            "Download options can only be returned when publicly accessible, "
-            "non-DRM media URLs are available to the server."
-        )
+    ydl_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True
     }
+
+    try:
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+
+            info = ydl.extract_info(
+                url,
+                download=False
+            )
+
+        formats = []
+
+        for f in info.get("formats", []):
+
+            format_url = f.get("url")
+
+            if not format_url:
+                continue
+
+            formats.append({
+                "format_id": f.get("format_id"),
+                "quality": f.get("format_note")
+                    or f.get("resolution")
+                    or "Available format",
+                "ext": f.get("ext"),
+                "filesize": f.get("filesize"),
+                "url": format_url,
+                "vcodec": f.get("vcodec"),
+                "acodec": f.get("acodec")
+            })
+
+        return {
+            "success": True,
+            "title": info.get("title"),
+            "thumbnail": info.get("thumbnail"),
+            "source_url": url,
+            "formats": formats
+        }
+
+    except Exception as e:
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Unable to process this video. "
+                "The content may be unavailable, restricted, "
+                "or unsupported. Only publicly accessible, "
+                "non-DRM content can be processed."
+            )
+        )
