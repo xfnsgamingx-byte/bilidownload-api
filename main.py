@@ -1,16 +1,20 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
-import re
+
 import yt_dlp
-import requests
-from urllib.parse import quote
+import os
+import re
+import uuid
+import shutil
+import tempfile
+from urllib.parse import urlparse, urlencode
 
 
 app = FastAPI(
     title="BiliDownload API",
-    description="Bilibili video information and download service"
+    description="Bilibili media downloader for publicly accessible, non-DRM content"
 )
 
 
@@ -27,334 +31,594 @@ class VideoRequest(BaseModel):
     url: str
 
 
-# --------------------------------------------------
-# HOME
-# --------------------------------------------------
+API_BASE_URL = "https://bilidownload-api.onrender.com"
+
+
+def validate_bilibili_url(url: str):
+
+    try:
+
+        parsed = urlparse(url)
+
+        hostname = (
+            parsed.hostname or ""
+        ).lower()
+
+    except Exception:
+
+        return False
+
+
+    allowed_domains = [
+        "bilibili.com",
+        "www.bilibili.com",
+        "b23.tv"
+    ]
+
+
+    if hostname in allowed_domains:
+
+        return True
+
+
+    if hostname.endswith(".bilibili.com"):
+
+        return True
+
+
+    return False
+
+
+def cleanup_folder(folder_path: str):
+
+    try:
+
+        if os.path.exists(folder_path):
+
+            shutil.rmtree(
+                folder_path,
+                ignore_errors=True
+            )
+
+    except Exception:
+
+        pass
+
 
 @app.get("/")
 def home():
+
     return {
         "status": "ok",
         "message": "BiliDownload API is running"
     }
 
 
-# --------------------------------------------------
-# HEALTH CHECK
-# --------------------------------------------------
-
 @app.get("/health")
 def health():
+
     return {
         "status": "healthy"
     }
 
-
-# --------------------------------------------------
-# CHECK BILIBILI URL
-# --------------------------------------------------
-
-def is_valid_bilibili_url(url):
-
-    patterns = [
-        r"(^|//)(www\.)?bilibili\.com/",
-        r"(^|//)b23\.tv/"
-    ]
-
-    return any(
-        re.search(pattern, url, re.IGNORECASE)
-        for pattern in patterns
-    )
-
-
-# --------------------------------------------------
-# GET VIDEO INFORMATION
-# --------------------------------------------------
 
 @app.post("/api/process")
 def process_video(data: VideoRequest):
 
     url = data.url.strip()
 
+
     if not url:
+
         raise HTTPException(
             status_code=400,
             detail="Please provide a Bilibili video URL."
         )
 
-    if not is_valid_bilibili_url(url):
+
+    if not validate_bilibili_url(url):
+
         raise HTTPException(
             status_code=400,
             detail="Please enter a valid Bilibili URL."
         )
 
+
     ydl_opts = {
+
         "quiet": True,
+
         "no_warnings": True,
+
         "skip_download": True,
+
         "noplaylist": True
+
     }
+
 
     try:
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with yt_dlp.YoutubeDL(
+            ydl_opts
+        ) as ydl:
 
             info = ydl.extract_info(
                 url,
                 download=False
             )
 
+
         formats = []
 
-        for f in info.get("formats", []):
 
-            format_id = f.get("format_id")
+        seen = set()
 
-            if not format_id:
-                continue
 
-            vcodec = f.get("vcodec")
-            acodec = f.get("acodec")
+        for f in info.get(
+            "formats",
+            []
+        ):
 
-            # खाली formats skip
-            if not f.get("url"):
-                continue
 
-            # केवल useful formats
-            quality = (
-                f.get("format_note")
-                or f.get("resolution")
-                or f.get("height")
-                or "Available format"
+            format_id = f.get(
+                "format_id"
             )
 
-            # अगर height है
-            if isinstance(f.get("height"), int):
 
-                if vcodec != "none" and acodec != "none":
-                    quality = f"{f.get('height')}p MP4"
+            if not format_id:
 
-                elif vcodec != "none":
-                    quality = f"{f.get('height')}p Video"
+                continue
 
-            # Audio format
-            if vcodec == "none" and acodec != "none":
+
+            ext = (
+                f.get("ext")
+                or "mp4"
+            )
+
+
+            vcodec = (
+                f.get("vcodec")
+                or "none"
+            )
+
+
+            acodec = (
+                f.get("acodec")
+                or "none"
+            )
+
+
+            # सिर्फ ऐसे formats दिखाओ
+            # जिनमें कम से कम video या audio मौजूद हो
+
+            if (
+                vcodec == "none" and
+                acodec == "none"
+            ):
+
+                continue
+
+
+            height = f.get(
+                "height"
+            )
+
+
+            width = f.get(
+                "width"
+            )
+
+
+            format_note = (
+                f.get("format_note")
+                or ""
+            )
+
+
+            # Media type
+
+            if (
+                vcodec == "none" and
+                acodec != "none"
+            ):
+
+                media_type = "audio"
 
                 quality = (
-                    f.get("format_note")
-                    or f"{f.get('abr', 'Audio')} kbps Audio"
+                    format_note
+                    or f.get("abr")
+                    or "Audio"
                 )
 
-            formats.append({
-                "format_id": format_id,
-                "quality": str(quality),
-                "ext": f.get("ext") or "mp4",
-                "filesize": f.get("filesize")
-                    or f.get("filesize_approx"),
-                "height": f.get("height"),
-                "vcodec": vcodec,
-                "acodec": acodec,
-                "has_video": vcodec != "none",
-                "has_audio": acodec != "none"
+
+            elif (
+                vcodec != "none" and
+                acodec == "none"
+            ):
+
+                media_type = "video_only"
+
+                if height:
+
+                    quality = (
+                        str(height)
+                        + "p Video"
+                    )
+
+                else:
+
+                    quality = (
+                        format_note
+                        or "Video"
+                    )
+
+
+            else:
+
+                media_type = "video"
+
+                if height:
+
+                    quality = (
+                        str(height)
+                        + "p"
+                    )
+
+                elif width:
+
+                    quality = (
+                        str(width)
+                        + "px"
+                    )
+
+                else:
+
+                    quality = (
+                        format_note
+                        or "Video"
+                    )
+
+
+            # Duplicate रोकने के लिए
+
+            unique_key = (
+                str(format_id)
+                + "|"
+                + str(ext)
+                + "|"
+                + str(vcodec)
+                + "|"
+                + str(acodec)
+            )
+
+
+            if unique_key in seen:
+
+                continue
+
+
+            seen.add(
+                unique_key
+            )
+
+
+            # Render download endpoint का URL
+
+            params = urlencode({
+
+                "url": url,
+
+                "format_id": format_id
+
             })
 
 
-        # पहले अच्छे formats दिखाओ
-        formats.sort(
-            key=lambda x: (
-                not (
-                    x["has_video"]
-                    and x["has_audio"]
-                ),
-                -(x["height"] or 0)
+            download_url = (
+                API_BASE_URL
+                + "/api/download?"
+                + params
             )
-        )
+
+
+            formats.append({
+
+                "format_id":
+                    format_id,
+
+                "quality":
+                    quality,
+
+                "ext":
+                    ext,
+
+                "filesize":
+                    f.get("filesize"),
+
+                "type":
+                    media_type,
+
+                "vcodec":
+                    vcodec,
+
+                "acodec":
+                    acodec,
+
+                "download_url":
+                    download_url
+
+            })
 
 
         return {
+
             "success": True,
-            "title": info.get("title"),
-            "thumbnail": info.get("thumbnail"),
-            "source_url": url,
-            "formats": formats
+
+            "title":
+                info.get("title")
+                or "Bilibili Video",
+
+            "thumbnail":
+                info.get("thumbnail"),
+
+            "source_url":
+                url,
+
+            "formats":
+                formats
+
         }
 
 
     except Exception:
 
         raise HTTPException(
+
             status_code=500,
+
             detail=(
                 "Unable to process this video. "
                 "The content may be unavailable, restricted, "
-                "or unsupported."
+                "or unsupported. Only publicly accessible, "
+                "non-DRM content can be processed."
             )
+
         )
 
-
-# --------------------------------------------------
-# DOWNLOAD THROUGH SERVER
-# --------------------------------------------------
 
 @app.get("/api/download")
 def download_video(
 
+    background_tasks: BackgroundTasks,
+
     url: str = Query(...),
+
     format_id: str = Query(...)
 
 ):
 
+
     url = url.strip()
 
-    if not is_valid_bilibili_url(url):
+    format_id = format_id.strip()
+
+
+    if not validate_bilibili_url(url):
 
         raise HTTPException(
+
             status_code=400,
+
             detail="Invalid Bilibili URL."
+
         )
 
 
-    ydl_opts = {
-        "quiet": True,
-        "no_warnings": True,
-        "skip_download": True,
-        "noplaylist": True
-    }
+    if not format_id:
+
+        raise HTTPException(
+
+            status_code=400,
+
+            detail="Invalid format."
+
+        )
+
+
+    download_folder = tempfile.mkdtemp(
+
+        prefix="bilidownload_"
+
+    )
+
+
+    output_template = os.path.join(
+
+        download_folder,
+
+        "%(title).80s_%(id)s.%(ext)s"
+
+    )
 
 
     try:
 
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+
+        # पहले video information लेकर
+        # format_id को validate करेंगे
+
+        info_opts = {
+
+            "quiet": True,
+
+            "no_warnings": True,
+
+            "skip_download": True,
+
+            "noplaylist": True
+
+        }
+
+
+        with yt_dlp.YoutubeDL(
+            info_opts
+        ) as ydl:
 
             info = ydl.extract_info(
+
                 url,
+
                 download=False
+
             )
 
 
-        selected_format = None
+        available_format_ids = {
+
+            str(item.get("format_id"))
+
+            for item in info.get(
+                "formats",
+                []
+            )
+
+            if item.get("format_id")
+
+        }
 
 
-        for f in info.get("formats", []):
+        if format_id not in available_format_ids:
 
-            if str(f.get("format_id")) == str(format_id):
-
-                selected_format = f
-                break
-
-
-        if not selected_format:
+            cleanup_folder(
+                download_folder
+            )
 
             raise HTTPException(
-                status_code=404,
-                detail="Selected format not found."
+
+                status_code=400,
+
+                detail="This download format is no longer available."
+
             )
 
 
-        media_url = selected_format.get("url")
+        # Selected format download
+
+        download_opts = {
+
+            "quiet": True,
+
+            "no_warnings": True,
+
+            "noplaylist": True,
+
+            "format": format_id,
+
+            "outtmpl": output_template,
+
+            "restrictfilenames": True,
+
+            "nopart": True
+
+        }
 
 
-        if not media_url:
+        with yt_dlp.YoutubeDL(
+            download_opts
+        ) as ydl:
 
-            raise HTTPException(
-                status_code=404,
-                detail="Download URL not available."
+
+            downloaded_info = ydl.extract_info(
+
+                url,
+
+                download=True
+
             )
 
 
-        ext = selected_format.get("ext") or "mp4"
-
-
-        title = info.get("title") or "video"
-
-
-        # Filename clean करो
-        filename = re.sub(
-            r'[\\/*?:"<>|]',
-            "",
-            title
-        )
-
-
-        filename = filename[:100]
-
-
-        filename = f"{filename}.{ext}"
-
-
-        # yt-dlp द्वारा required headers
-        headers = selected_format.get("http_headers") or {}
-
-        headers.setdefault(
-            "User-Agent",
-            "Mozilla/5.0"
-        )
-
-
-        response = requests.get(
-
-            media_url,
-
-            headers=headers,
-
-            stream=True,
-
-            timeout=30
-        )
-
-
-        if response.status_code != 200:
-
-            raise HTTPException(
-                status_code=502,
-                detail="Unable to fetch the media file."
+            file_path = ydl.prepare_filename(
+                downloaded_info
             )
 
 
-        content_type = (
-            response.headers.get("Content-Type")
-            or "application/octet-stream"
-        )
+        # अगर expected filename नहीं मिला
+        # तो folder में actual downloaded file ढूंढो
+
+        if not os.path.exists(
+            file_path
+        ):
 
 
-        def generate():
+            files = []
 
-            try:
 
-                for chunk in response.iter_content(
-                    chunk_size=1024 * 256
+            for filename in os.listdir(
+                download_folder
+            ):
+
+                full_path = os.path.join(
+
+                    download_folder,
+
+                    filename
+
+                )
+
+
+                if os.path.isfile(
+                    full_path
                 ):
 
-                    if chunk:
-
-                        yield chunk
-
-            finally:
-
-                response.close()
-
-
-        encoded_filename = quote(filename)
-
-
-        return StreamingResponse(
-
-            generate(),
-
-            media_type=content_type,
-
-            headers={
-
-                "Content-Disposition":
-                    f"attachment; filename*=UTF-8''{encoded_filename}",
-
-                "Content-Length":
-                    response.headers.get(
-                        "Content-Length",
-                        ""
+                    files.append(
+                        full_path
                     )
 
-            }
+
+            if files:
+
+                file_path = files[0]
+
+
+        if not os.path.exists(
+            file_path
+        ):
+
+            cleanup_folder(
+                download_folder
+            )
+
+            raise Exception(
+                "Downloaded file could not be found."
+            )
+
+
+        filename = os.path.basename(
+            file_path
+        )
+
+
+        # Response खत्म होने के बाद
+        # temporary file delete होगा
+
+        background_tasks.add_task(
+
+            cleanup_folder,
+
+            download_folder
+
+        )
+
+
+        return FileResponse(
+
+            path=file_path,
+
+            filename=filename,
+
+            media_type="application/octet-stream",
+
+            background=background_tasks
 
         )
 
@@ -366,14 +630,20 @@ def download_video(
 
     except Exception:
 
+
+        cleanup_folder(
+            download_folder
+        )
+
+
         raise HTTPException(
 
             status_code=500,
 
             detail=(
-                "Unable to download this media. "
-                "The temporary media link may have expired "
-                "or the content may be restricted."
+                "Unable to download this format. "
+                "The video may be restricted, expired, "
+                "or temporarily unavailable."
             )
 
         )
